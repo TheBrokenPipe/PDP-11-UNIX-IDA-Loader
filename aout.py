@@ -8,6 +8,7 @@ import ida_segment
 import ida_bytes
 import ida_name
 import ida_lines
+import ida_entry
 
 def read_file(fp, off, count):
     fp.seek(off)
@@ -36,11 +37,12 @@ class SymbolType(Enum):
     BSS_EXT_SYM = 0x24
 
 class SymbolEntry:
-    def __init__(this, name, type, value):
+    def __init__(this, name, type, value, obj):
         this._name = name
         this._type = SymbolType(type)
         this._value = value
         this._is_static = False
+        this._object = obj
 
     def get_name(this):
         return this._name
@@ -48,6 +50,8 @@ class SymbolEntry:
         return this._type
     def get_value(this):
         return this._value
+    def get_obj(this):
+        return this._object
     def set_name(this, name):
         this._name = name
     def is_static(this):
@@ -84,6 +88,10 @@ class ExecFile:
             # V1 binary
             this._text_off = 0
             this._text_size = get_word(fp, 2)
+            this._sym_size = get_word(fp, 4)
+            this._reloc_size = get_word(fp, 6)
+            this._bss_size = get_word(fp, 8)
+            
             # TODO finish it
         elif magic == 0x107:
             this._text_off = 0x10
@@ -115,11 +123,14 @@ class ExecFile:
             this._data_data = read_file(fp, this._data_off, this._data_size)
 
             if this._has_syms:
+                curobj = ""
                 for i in range(0, this._sym_size // 12):
                     name = get_str(fp, this._sym_off + i * 12, 8)
                     type = get_word(fp, this._sym_off + i * 12 + 8)
                     value = get_word(fp, this._sym_off + i * 12 + 10)
-                    this._symbols.append(SymbolEntry(name, type, value))
+                    if SymbolType(type) == SymbolType.OBJECT:
+                        curobj = name
+                    this._symbols.append(SymbolEntry(name, type, value, curobj))
 
     def get_origin(this):
         return this._base_address
@@ -135,6 +146,9 @@ class ExecFile:
 
     def has_symbols(this):
         return this._has_syms
+
+    def has_reloc(this):
+        return this._has_syms and this._has_reloc
 
     def get_symbols(this):
         return this._symbols.copy()
@@ -158,7 +172,7 @@ def accept_file(f, path):
 
 def get_objects(syms, length):
     objsyms = get_object_syms(syms)
-    sorted_syms = sorted(objsyms, key=lambda sym: sym.get_value()) + [SymbolEntry("", 0x1F, length)]
+    sorted_syms = sorted(objsyms, key=lambda sym: sym.get_value()) + [SymbolEntry("", 0x1F, length, "")]
     result = []
     for i in range(len(sorted_syms) - 1):
         result.append((sorted_syms[i].get_name(), sorted_syms[i].get_value(), sorted_syms[i + 1].get_value() - sorted_syms[i].get_value()))
@@ -180,10 +194,14 @@ def get_import_syms(syms):
     return [sym for sym in syms if (sym.get_type() == SymbolType.IMPORT_SYM)]
 
 def rename_symbol(sym, objects):
-    for objname, start, _ in reversed(objects):
-        if sym.get_value() >= start:
+    if sym.get_obj() != "":
+        sym.set_name(sym.get_name() + "@" + sym.get_obj())
+        return
+    for objname, start, length in objects:
+        if sym.get_value() >= start and sym.get_value() < start + length:
             sym.set_name(sym.get_name() + "@" + objname)
-            break
+            return
+    sym.set_name(sym.get_name() + "@" + str(sym.get_value()))
 
 def rename_static_syms(syms, globals, objects):
     name_to_syms = {}
@@ -228,7 +246,7 @@ def load_file(f, neflags, format_string):
     if file.has_symbols():
         syms = file.get_symbols()
         obj_syms = get_object_syms(syms)
-        objs = get_objects(obj_syms, file.get_program_size())
+        objs = get_objects(obj_syms, text_base + text_size - file.get_origin())
         maxlen = 0
         for objname, _, _ in objs:
             maxlen = len(objname) if len(objname) > maxlen else maxlen
@@ -239,10 +257,15 @@ def load_file(f, neflags, format_string):
         rename_static_syms(static_syms, global_syms, objs)
         for sym in syms:
             #TODO absolute symbols
-            if sym.get_type() == SymbolType.TEXT_SYM or sym.get_type() == SymbolType.TEXT_EXT_SYM:
-                ida_name.set_name(text_base + sym.get_value(), sym.get_name(), ida_name.SN_NON_PUBLIC if sym.is_static() else ida_name.SN_PUBLIC)
-            elif sym.get_type() == SymbolType.DATA_SYM or sym.get_type() == SymbolType.DATA_EXT_SYM:
-                ida_name.set_name(data_base + sym.get_value(), sym.get_name(), ida_name.SN_NON_PUBLIC if sym.is_static() else ida_name.SN_PUBLIC)
-            elif sym.get_type() == SymbolType.BSS_SYM or sym.get_type() == SymbolType.BSS_EXT_SYM:
-                ida_name.set_name(bss_base + sym.get_value(), sym.get_name(), ida_name.SN_NON_PUBLIC if sym.is_static() else ida_name.SN_PUBLIC)
+            type = sym.get_type()
+            if type in [SymbolType.TEXT_SYM, SymbolType.TEXT_EXT_SYM, SymbolType.DATA_SYM, SymbolType.DATA_EXT_SYM, SymbolType.BSS_SYM, SymbolType.BSS_EXT_SYM]:
+                ida_name.set_name(file.get_origin() + sym.get_value(), sym.get_name(), ida_name.SN_NON_PUBLIC if sym.is_static() else ida_name.SN_PUBLIC)
+        for sym in global_syms:
+            ea = file.get_origin() + sym.get_value()
+            iscode = ea >= text_base and ea < text_base + text_size
+            ida_entry.add_entry(ea, ea, sym.get_name(), iscode)
+    # TODO: Export "start" if the binary has no unresolved references.
+    # if ida_name.get_name(file.get_origin()) == "":
+    #     ida_name.set_name(file.get_origin() + file.get_origin(), "start", ida_name.SN_NON_PUBLIC)
+    # ida_entry.add_entry(file.get_origin(), file.get_origin(), ida_name.get_name(file.get_origin()), 1)
     return 1
